@@ -16,15 +16,14 @@
 //! # Related Links
 //! * <https://tools.suckless.org/farbfeld/> - the farbfeld specification
 
-use std::convert::TryFrom;
 use std::i64;
-use std::io::{self, Seek, SeekFrom, Read, Write};
-
-use byteorder::{BigEndian, ByteOrder, NativeEndian};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use crate::color::ColorType;
-use crate::error::{DecodingError, ImageError, ImageResult, UnsupportedError, UnsupportedErrorKind};
-use crate::image::{self, ImageDecoder, ImageDecoderExt, ImageEncoder, ImageFormat, Progress};
+use crate::error::{
+    DecodingError, ImageError, ImageResult, UnsupportedError, UnsupportedErrorKind,
+};
+use crate::image::{self, ImageDecoder, ImageDecoderRect, ImageEncoder, ImageFormat, Progress};
 
 /// farbfeld Reader
 pub struct FarbfeldReader<R: Read> {
@@ -40,20 +39,16 @@ impl<R: Read> FarbfeldReader<R> {
     fn new(mut buffered_read: R) -> ImageResult<FarbfeldReader<R>> {
         fn read_dimm<R: Read>(from: &mut R) -> ImageResult<u32> {
             let mut buf = [0u8; 4];
-            from.read_exact(&mut buf).map_err(|err|
-                ImageError::Decoding(DecodingError::new(
-                    ImageFormat::Farbfeld.into(),
-                    err,
-                )))?;
-            Ok(BigEndian::read_u32(&buf))
+            from.read_exact(&mut buf).map_err(|err| {
+                ImageError::Decoding(DecodingError::new(ImageFormat::Farbfeld.into(), err))
+            })?;
+            Ok(u32::from_be_bytes(buf))
         }
 
         let mut magic = [0u8; 8];
-        buffered_read.read_exact(&mut magic).map_err(|err|
-            ImageError::Decoding(DecodingError::new(
-                ImageFormat::Farbfeld.into(),
-                err,
-            )))?;
+        buffered_read.read_exact(&mut magic).map_err(|err| {
+            ImageError::Decoding(DecodingError::new(ImageFormat::Farbfeld.into(), err))
+        })?;
         if &magic != b"farbfeld" {
             return Err(ImageError::Decoding(DecodingError::new(
                 ImageFormat::Farbfeld.into(),
@@ -68,7 +63,7 @@ impl<R: Read> FarbfeldReader<R> {
             current_offset: 0,
             cached_byte: None,
         };
-        
+
         if crate::utils::check_dimension_overflow(
             reader.width,
             reader.height,
@@ -120,35 +115,44 @@ impl<R: Read + Seek> Seek for FarbfeldReader<R> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         fn parse_offset(original_offset: u64, end_offset: u64, pos: SeekFrom) -> Option<i64> {
             match pos {
-                SeekFrom::Start(off) =>
-                    i64::try_from(off).ok()?.checked_sub(i64::try_from(original_offset).ok()?),
-                SeekFrom::End(off) =>
+                SeekFrom::Start(off) => i64::try_from(off)
+                    .ok()?
+                    .checked_sub(i64::try_from(original_offset).ok()?),
+                SeekFrom::End(off) => {
                     if off < i64::try_from(end_offset).unwrap_or(i64::MAX) {
                         None
                     } else {
                         Some(i64::try_from(end_offset.checked_sub(original_offset)?).ok()? + off)
-                    },
-                SeekFrom::Current(off) =>
+                    }
+                }
+                SeekFrom::Current(off) => {
                     if off < i64::try_from(original_offset).unwrap_or(i64::MAX) {
                         None
                     } else {
                         Some(off)
-                    },
+                    }
+                }
             }
         }
 
         let original_offset = self.current_offset;
         let end_offset = self.width as u64 * self.height as u64 * 2;
-        let offset_from_current = parse_offset(original_offset, end_offset, pos)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid seek to a negative or overflowing position"))?;
+        let offset_from_current =
+            parse_offset(original_offset, end_offset, pos).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid seek to a negative or overflowing position",
+                )
+            })?;
 
         // TODO: convert to seek_relative() once that gets stabilised
         self.inner.seek(SeekFrom::Current(offset_from_current))?;
         self.current_offset = if offset_from_current < 0 {
-                                  original_offset.checked_sub(offset_from_current.wrapping_neg() as u64)
-                              } else {
-                                  original_offset.checked_add(offset_from_current as u64)
-                              }.expect("This should've been checked above");
+            original_offset.checked_sub(offset_from_current.wrapping_neg() as u64)
+        } else {
+            original_offset.checked_add(offset_from_current as u64)
+        }
+        .expect("This should've been checked above");
 
         if self.current_offset < end_offset && self.current_offset % 2 == 1 {
             let curr = self.inner.seek(SeekFrom::Current(-1))?;
@@ -162,10 +166,11 @@ impl<R: Read + Seek> Seek for FarbfeldReader<R> {
     }
 }
 
-fn consume_channel<R: Read>(from: &mut R, to: &mut [u8]) -> io::Result<()> {
+fn consume_channel<R: Read>(from: &mut R, mut to: &mut [u8]) -> io::Result<()> {
     let mut ibuf = [0u8; 2];
     from.read_exact(&mut ibuf)?;
-    NativeEndian::write_u16(to, BigEndian::read_u16(&ibuf));
+    to.write_all(&u16::from_be_bytes(ibuf).to_ne_bytes())?;
+
     Ok(())
 }
 
@@ -184,7 +189,9 @@ pub struct FarbfeldDecoder<R: Read> {
 impl<R: Read> FarbfeldDecoder<R> {
     /// Creates a new decoder that decodes from the stream ```r```
     pub fn new(buffered_read: R) -> ImageResult<FarbfeldDecoder<R>> {
-        Ok(FarbfeldDecoder { reader: FarbfeldReader::new(buffered_read)? })
+        Ok(FarbfeldDecoder {
+            reader: FarbfeldReader::new(buffered_read)?,
+        })
     }
 }
 
@@ -208,7 +215,7 @@ impl<'a, R: 'a + Read> ImageDecoder<'a> for FarbfeldDecoder<R> {
     }
 }
 
-impl<'a, R: 'a + Read + Seek> ImageDecoderExt<'a> for FarbfeldDecoder<R> {
+impl<'a, R: 'a + Read + Seek> ImageDecoderRect<'a> for FarbfeldDecoder<R> {
     fn read_rect_with_progress<F: Fn(Progress)>(
         &mut self,
         x: u32,
@@ -220,10 +227,18 @@ impl<'a, R: 'a + Read + Seek> ImageDecoderExt<'a> for FarbfeldDecoder<R> {
     ) -> ImageResult<()> {
         // A "scanline" (defined as "shortest non-caching read" in the doc) is just one channel in this case
 
-        let start = self.reader.seek(SeekFrom::Current(0))?;
-        image::load_rect(x, y, width, height, buf, progress_callback, self,
-                         |s, scanline| s.reader.seek(SeekFrom::Start(scanline * 2)).map(|_| ()),
-                         |s, buf| s.reader.read_exact(buf))?;
+        let start = self.reader.stream_position()?;
+        image::load_rect(
+            x,
+            y,
+            width,
+            height,
+            buf,
+            progress_callback,
+            self,
+            |s, scanline| s.reader.seek(SeekFrom::Start(scanline * 2)).map(|_| ()),
+            |s, buf| s.reader.read_exact(buf),
+        )?;
         self.reader.seek(SeekFrom::Start(start))?;
         Ok(())
     }
@@ -240,9 +255,20 @@ impl<W: Write> FarbfeldEncoder<W> {
         FarbfeldEncoder { w: buffered_writer }
     }
 
-    /// Encodes the image ```data``` (native endian)
-    /// that has dimensions ```width``` and ```height```
+    /// Encodes the image `data` (native endian) that has dimensions `width` and `height`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `width * height * 8 != data.len()`.
+    #[track_caller]
     pub fn encode(self, data: &[u8], width: u32, height: u32) -> ImageResult<()> {
+        let expected_buffer_len = (width as u64 * height as u64).saturating_mul(8);
+        assert_eq!(
+            expected_buffer_len,
+            data.len() as u64,
+            "Invalid buffer length: expected {expected_buffer_len} got {} for {width}x{height} image",
+            data.len(),
+        );
         self.encode_impl(data, width, height)?;
         Ok(())
     }
@@ -250,16 +276,12 @@ impl<W: Write> FarbfeldEncoder<W> {
     fn encode_impl(mut self, data: &[u8], width: u32, height: u32) -> io::Result<()> {
         self.w.write_all(b"farbfeld")?;
 
-        let mut buf = [0u8; 4];
-        BigEndian::write_u32(&mut buf, width);
-        self.w.write_all(&buf)?;
-
-        BigEndian::write_u32(&mut buf, height);
-        self.w.write_all(&buf)?;
+        self.w.write_all(&width.to_be_bytes())?;
+        self.w.write_all(&height.to_be_bytes())?;
 
         for channel in data.chunks_exact(2) {
-            BigEndian::write_u16(&mut buf, NativeEndian::read_u16(channel));
-            self.w.write_all(&buf[..2])?;
+            self.w
+                .write_all(&u16::from_ne_bytes(channel.try_into().unwrap()).to_be_bytes())?;
         }
 
         Ok(())
@@ -267,6 +289,7 @@ impl<W: Write> FarbfeldEncoder<W> {
 }
 
 impl<W: Write> ImageEncoder for FarbfeldEncoder<W> {
+    #[track_caller]
     fn write_image(
         self,
         buf: &[u8],
@@ -275,10 +298,12 @@ impl<W: Write> ImageEncoder for FarbfeldEncoder<W> {
         color_type: ColorType,
     ) -> ImageResult<()> {
         if color_type != ColorType::Rgba16 {
-            return Err(ImageError::Unsupported(UnsupportedError::from_format_and_kind(
-                ImageFormat::Farbfeld.into(),
-                UnsupportedErrorKind::Color(color_type.into()),
-            )));
+            return Err(ImageError::Unsupported(
+                UnsupportedError::from_format_and_kind(
+                    ImageFormat::Farbfeld.into(),
+                    UnsupportedErrorKind::Color(color_type.into()),
+                ),
+            ));
         }
 
         self.encode(buf, width, height)
@@ -288,9 +313,9 @@ impl<W: Write> ImageEncoder for FarbfeldEncoder<W> {
 #[cfg(test)]
 mod tests {
     use crate::codecs::farbfeld::FarbfeldDecoder;
-    use crate::ImageDecoderExt;
-    use std::io::{Cursor, Seek, SeekFrom};
+    use crate::ImageDecoderRect;
     use byteorder::{ByteOrder, NativeEndian};
+    use std::io::{Cursor, Seek, SeekFrom};
 
     static RECTANGLE_IN: &[u8] =     b"farbfeld\
                                        \x00\x00\x00\x02\x00\x00\x00\x03\
@@ -300,32 +325,39 @@ mod tests {
 
     #[test]
     fn read_rect_1x2() {
-        static RECTANGLE_OUT: &[u16] =                                 &[0xF30D, 0xF20E, 0xF10F, 0xF010,
-                                                                         0xEB15, 0xEA16, 0xE917, 0xE818];
+        static RECTANGLE_OUT: &[u16] = &[
+            0xF30D, 0xF20E, 0xF10F, 0xF010, 0xEB15, 0xEA16, 0xE917, 0xE818,
+        ];
 
         read_rect(1, 1, 1, 2, RECTANGLE_OUT);
     }
 
     #[test]
     fn read_rect_2x2() {
-        static RECTANGLE_OUT: &[u16] = &[0xFF01, 0xFE02, 0xFD03, 0xFC04, 0xFB05, 0xFA06, 0xF907, 0xF808,
-                                         0xF709, 0xF60A, 0xF50B, 0xF40C, 0xF30D, 0xF20E, 0xF10F, 0xF010];
+        static RECTANGLE_OUT: &[u16] = &[
+            0xFF01, 0xFE02, 0xFD03, 0xFC04, 0xFB05, 0xFA06, 0xF907, 0xF808, 0xF709, 0xF60A, 0xF50B,
+            0xF40C, 0xF30D, 0xF20E, 0xF10F, 0xF010,
+        ];
 
         read_rect(0, 0, 2, 2, RECTANGLE_OUT);
     }
 
     #[test]
     fn read_rect_2x1() {
-        static RECTANGLE_OUT: &[u16] = &[0xEF11, 0xEE12, 0xED13, 0xEC14, 0xEB15, 0xEA16, 0xE917, 0xE818];
+        static RECTANGLE_OUT: &[u16] = &[
+            0xEF11, 0xEE12, 0xED13, 0xEC14, 0xEB15, 0xEA16, 0xE917, 0xE818,
+        ];
 
         read_rect(0, 2, 2, 1, RECTANGLE_OUT);
     }
 
     #[test]
     fn read_rect_2x3() {
-        static RECTANGLE_OUT: &[u16] = &[0xFF01, 0xFE02, 0xFD03, 0xFC04, 0xFB05, 0xFA06, 0xF907, 0xF808,
-                                         0xF709, 0xF60A, 0xF50B, 0xF40C, 0xF30D, 0xF20E, 0xF10F, 0xF010,
-                                         0xEF11, 0xEE12, 0xED13, 0xEC14, 0xEB15, 0xEA16, 0xE917, 0xE818];
+        static RECTANGLE_OUT: &[u16] = &[
+            0xFF01, 0xFE02, 0xFD03, 0xFC04, 0xFB05, 0xFA06, 0xF907, 0xF808, 0xF709, 0xF60A, 0xF50B,
+            0xF40C, 0xF30D, 0xF20E, 0xF10F, 0xF010, 0xEF11, 0xEE12, 0xED13, 0xEC14, 0xEB15, 0xEA16,
+            0xE917, 0xE818,
+        ];
 
         read_rect(0, 0, 2, 3, RECTANGLE_OUT);
     }
@@ -350,9 +382,9 @@ mod tests {
     }
 
     #[test]
-    fn dimension_overflow() {        
+    fn dimension_overflow() {
         let header = b"farbfeld\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF";
-        
+
         assert!(FarbfeldDecoder::new(Cursor::new(header)).is_err());
     }
 
